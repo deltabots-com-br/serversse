@@ -1,13 +1,11 @@
 #!/bin/bash
-# run.sh
+# run.sh (Versão aprimorada usando ENVs)
 
-# A porta 8000 é a porta padrão que o Uvicorn irá expor,
-# e que você configurará no EasyPanel.
-PORT=8000
+# Lê as variáveis de ambiente, com fallbacks seguros
+PORT=${APP_PORT:-8000}
+WORKERS=${UVICORN_WORKERS:-1} # 1 como um fallback seguro se a variável não for definida
 
-echo "Iniciando servidor FastAPI com Uvicorn na porta $PORT..."
+echo "Iniciando servidor FastAPI com Uvicorn na porta $PORT e $WORKERS workers..."
 
 # Executa o servidor ASGI Uvicorn
-# --host 0.0.0.0: permite acessos externos (obrigatório em containers/EasyPanel)
-# --workers 4: O EasyPanel é multi-core; utilize workers para melhor desempenho.
-uvicorn main:app --host 0.0.0.0 --port $PORT --workers 4
+uvicorn main:app --host 0.0.0.0 --port $PORT --workers $WORKERS
