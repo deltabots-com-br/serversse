@@ -10,9 +10,9 @@ import redis.asyncio as aioredis # Cliente Redis assíncrono
 
 # --- Configuração do Redis e Variáveis de Ambiente ---
 
-# O EasyPanel deve fornecer a URL do Redis via variável de ambiente.
-# Use 'redis://localhost:6379' como fallback para desenvolvimento local.
+# Ponto de Diagnóstico: Mostra a leitura da ENV
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+print(f"DIAGNÓSTICO: REDIS_URL lida do ambiente: {REDIS_URL}")
 
 # Variável global para armazenar o cliente Redis
 redis_client: aioredis.Redis = None
@@ -26,24 +26,33 @@ async def lifespan(app: FastAPI):
     Inicia e fecha a conexão com o Redis.
     """
     global redis_client
+    print("DIAGNÓSTICO: --- 1. INICIANDO O LIFESPAN DA APLICAÇÃO ---")
+    
     try:
-        # A decode_responses=True garante que as strings retornadas do Redis sejam decodificadas
+        # Tenta a conexão com o URL configurado
         redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
         await redis_client.ping()
-        print(f"✅ Conexão com Redis estabelecida em: {REDIS_URL}")
-    except Exception as e:
-        # É crucial falhar se não conseguir conectar, especialmente em produção
-        print(f"❌ FALHA CRÍTICA ao conectar ao Redis: {e}")
-        # Em um cenário real de produção, você pode relançar a exceção ou sair.
+        print(f"✅ DIAGNÓSTICO: 2. Conexão com Redis estabelecida com sucesso!")
         
-    yield # A aplicação está rodando
+    except Exception as e:
+        # Se a conexão falhar, loga o erro CRÍTICO e força a parada (fail-fast)
+        print(f"❌ DIAGNÓSTICO: 2. FALHA CRÍTICA ao conectar ao Redis em {REDIS_URL}: {e}")
+        
+        # Em produção, você pode querer forçar o container a parar para que o orquestrador reinicie.
+        # Caso o problema seja persistente, a EasyPanel mostrará o status 'CrashLoopBackOff'
+        # ou 'Exited'. Comente a linha abaixo se preferir que a API suba mesmo sem o Redis
+        # (mas as rotas SSE não funcionarão).
+        # os._exit(1)
+        
+    yield # A aplicação está rodando (aguardando requisições)
 
     # Fechamento do Redis ao desligar
     if redis_client:
         await redis_client.close()
-        print("🛑 Conexão com Redis fechada.")
+        print("🛑 DIAGNÓSTICO: Conexão com Redis fechada.")
 
 app = FastAPI(lifespan=lifespan)
+print("DIAGNÓSTICO: --- 3. FastAPI App inicializado. Aguardando o Uvicorn... ---")
 
 
 # --- Dependências de Injeção ---
@@ -51,7 +60,8 @@ app = FastAPI(lifespan=lifespan)
 async def get_redis() -> aioredis.Redis:
     """Dependência para obter o cliente Redis, garantindo que foi inicializado."""
     if redis_client is None:
-        raise HTTPException(status_code=500, detail="Serviço Redis indisponível.")
+        # Gera erro 503 Service Unavailable se o Redis não estiver vivo
+        raise HTTPException(status_code=503, detail="Serviço de Mensageria (Redis) indisponível.")
     return redis_client
 
 # --- Segurança e Rotas Dinâmicas ---
@@ -59,22 +69,17 @@ async def get_redis() -> aioredis.Redis:
 def require_auth_and_get_channel(channel_id: str, request: Request):
     """
     Dependência de segurança para autorizar o acesso ao canal dinâmico.
-    
-    A implementação atual requer que o header "X-User-ID"
-    corresponda ao {channel_id} da rota.
     """
     user_id_header = request.headers.get("X-User-ID")
     
     # Validação da Rota Dinâmica
-    if not channel_id.isalnum(): # Aceita letras e números
+    if not channel_id.isalnum(): 
         raise HTTPException(status_code=400, detail="ID de canal inválido.")
         
     # Autorização: Verifica se o usuário tem permissão para assinar este canal
     if user_id_header != channel_id:
-        # No front-end, o cliente precisa incluir o header X-User-ID
-        raise HTTPException(status_code=403, detail="Acesso negado ao canal: ID de usuário não corresponde.")
+        raise HTTPException(status_code=403, detail="Acesso negado ao canal: ID de usuário não corresponde ou cabeçalho 'X-User-ID' ausente.")
         
-    # O canal do Redis será prefixado
     return f"sse_channel:{channel_id}"
 
 # --- Rota Dinâmica SSE (O Consumidor) ---
@@ -89,6 +94,8 @@ async def event_stream(
     Endpoint SSE que assina o canal dinâmico do Redis.
     """
     
+    print(f"DIAGNÓSTICO: Novo cliente conectando-se ao canal {redis_channel}")
+
     async def event_generator():
         # Cria um objeto PubSub e se inscreve no canal
         pubsub = r.pubsub()
@@ -96,45 +103,39 @@ async def event_stream(
 
         try:
             while True:
-                # 1. Verifica se o cliente web desconectou
                 if await request.is_disconnected():
-                    print(f"Cliente desconectado de {redis_channel}.")
+                    print(f"DIAGNÓSTICO: Cliente desconectado de {redis_channel}.")
                     break
                 
-                # 2. Aguarda a próxima mensagem do Redis
-                # O timeout garante que o loop não trave e permite checar a desconexão
-                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=15)
+                # Timeout reduzido para verificar mais rápido a desconexão
+                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=5) 
                 
                 if message and message.get('data'):
                     try:
-                        # O dado do Redis é uma string JSON.
                         data_str = message.get('data')
                         data = json.loads(data_str)
                     except json.JSONDecodeError:
-                        print(f"Erro ao decodificar JSON do Redis: {data_str}")
+                        print(f"DIAGNÓSTICO: Erro ao decodificar JSON do Redis: {data_str}")
                         continue
 
                     # Formata a mensagem para o padrão SSE
                     yield {
-                        "event": data.get("event", "update"), # Tipo de evento (ex: 'order_status', 'new_notification')
-                        "data": json.dumps(data.get("payload")) # O payload real
+                        "event": data.get("event", "update"), 
+                        "data": json.dumps(data.get("payload")) 
                     }
                 else:
-                    # 3. Envia um "keep-alive" se não houver mensagem, 
-                    # útil para evitar que proxies (como Nginx/Load Balancers) fechem a conexão
+                    # Envia um "keep-alive" a cada 5s (o timeout atual) se não houver mensagem
                     yield {"event": "keep-alive", "data": ""}
 
         except asyncio.CancelledError:
-            # Captura exceção se o gerador for cancelado (shutdown do servidor)
-            pass 
+            print(f"DIAGNÓSTICO: Conexão SSE com {redis_channel} cancelada (provavelmente shutdown).")
+        except Exception as e:
+            print(f"ERRO CRÍTICO no gerador de eventos para {redis_channel}: {e}")
         finally:
-            # 4. Garante que a assinatura e o objeto PubSub sejam fechados
             await pubsub.unsubscribe(redis_channel)
             await pubsub.close()
-            print(f"PubSub para {redis_channel} finalizado.")
+            print(f"DIAGNÓSTICO: PubSub para {redis_channel} finalizado.")
 
-    # Retorna o EventSourceResponse
-    # O parâmetro 'ping' padrão do SSE-Starlette ajuda a manter a conexão viva
     return EventSourceResponse(event_generator())
 
 
@@ -147,20 +148,23 @@ async def publish_message(
     r: aioredis.Redis = Depends(get_redis)
 ):
     """
-    Rota para publicar uma mensagem no canal do Redis. 
-    Idealmente, esta rota só deve ser acessível internamente ou por um serviço autorizado.
+    Rota para publicar uma mensagem no canal do Redis.
     """
     
-    # Crie o payload no formato que o consumidor espera
+    # Validação do channel_id para ser seguro
+    if not channel_id.isalnum():
+        raise HTTPException(status_code=400, detail="ID de canal inválido para publicação.")
+
     payload = {
         "event": message.get("event", "update"),
         "payload": message.get("data")
     }
     
-    # Publica no canal do Redis
-    await r.publish(f"sse_channel:{channel_id}", json.dumps(payload))
+    redis_channel = f"sse_channel:{channel_id}"
+    print(f"DIAGNÓSTICO: Publicando mensagem em {redis_channel}")
+    await r.publish(redis_channel, json.dumps(payload))
     
     return JSONResponse(
         content={"status": "published", "channel": channel_id},
-        status_code=202 # Accepted
+        status_code=202 
     )
